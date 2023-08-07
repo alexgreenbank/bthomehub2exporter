@@ -17,42 +17,23 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/antchfx/xmlquery"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
-	// States
-	S_INIT         = iota
-	S_CONNECTED    = iota
-	S_DISCONNECTED = iota
-	S_TIMEOUT      = iota
-	S_ERROR        = iota
-	S_PARSEFAIL    = iota
-	usec_in_s      = 1000000.0
+	usec_in_s = 1000000.0
 )
 
 var (
-	mu                           sync.Mutex
-	hc                           *http.Client
-	state                        = S_INIT
-	lastgoodpoll                 time.Time     // timestamp of last successful poll
-	lastpoll                     time.Time     // timestamp of last poll
-	laststatuscode               int           // http response code of last poll
-	lastpolldur                  time.Duration // elapsed time for last poll
-	lastparsedur                 time.Duration // elapsed time for last parsing
-	lasterror                    string        // string of error from http client or parser, blank if none
-	lasterrortime                time.Time     // time of last error
-	bps_up                       int           // speed up/down
-	bps_down                     int
-	bbu_up                       int // bb usage up/down
-	bbu_down                     int
-	sysuptime                    int
-	connuptime                   int
-	cfg                          Config
-	substring_square_brackets_re = regexp.MustCompile(`([^[\]]+)`)
+	hc                        *http.Client
+	cfg                       Config
+	substringSquareBracketsRe = regexp.MustCompile(`([^[\]]+)`)
+	recorder                  Recorder
 )
 
 type Config struct {
@@ -79,40 +60,29 @@ func RegisterFlagsWithPrefix(prefix string) {
 	flag.StringVar(&cfg.file, prefix+"file", "", "Parse file directly")
 }
 
-func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscode int) error {
-	speed_up := 0
-	speed_down := 0
-	bytes_up := 0
-	bytes_down := 0
-	s_uptime := 0
-	c_uptime := 0
-
-	parsetime := time.Now()
+func parseXML(body string) error {
+	parseTime := time.Now()
 	doc, err := xmlquery.Parse(strings.NewReader(body))
-	dur_parse := time.Since(parsetime)
+	durParse := time.Since(parseTime)
+
+	recorder.measureParseDur(durParse)
+
 	if err != nil {
-		mu.Lock()
-		state = S_PARSEFAIL
-		lastpoll = polltime
-		laststatuscode = statuscode
-		lastpolldur = dur_poll
-		lastparsedur = dur_parse
-		lasterror = err.Error()
-		lasterrortime = parsetime
-		mu.Unlock()
+		// TODO - do something with err.Error() ?
+		recorder.measureLastError(parseTime)
 		log.Fatal("parsing:", err)
 		return err
 	}
 	// fmt.Printf("parsing\n")
 	// Parsed ok, find top level status
-	x_status := xmlquery.FindOne(doc, "//status")
-	if x_status == nil {
+	xStatus := xmlquery.FindOne(doc, "//status")
+	if xStatus == nil {
 		log.Fatal("No <status>")
 		// TODO
 		return nil
 	}
 	// Find <link_status>
-	if val := xmlquery.FindOne(x_status, "//link_status/@value"); val != nil {
+	if val := xmlquery.FindOne(xStatus, "//link_status/@value"); val != nil {
 		// fmt.Printf("Got raw link_status value of [%s]\n", val.InnerText())
 		str, err := url.QueryUnescape(val.InnerText())
 		if err != nil {
@@ -123,7 +93,8 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 		// fmt.Printf("Got link_status value of [%s]\n", str)
 		if strings.HasPrefix(str, "connected;") {
 			// <link_status value="connected%3Bvdsl%3B462385"/>
-			n, err := fmt.Sscanf(str, "connected;vdsl;%d", &c_uptime)
+			connUptime := 0
+			n, err := fmt.Sscanf(str, "connected;vdsl;%d", &connUptime)
 			if err != nil {
 				// TODO - failed to convert uptime
 				log.Fatal("Failed to convert conn_uptime:1:", err)
@@ -132,21 +103,16 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 				// TODO - failed to convert uptime
 				log.Fatal("Failed to convert conn_uptime:2:", err)
 			}
-			// fmt.Printf("Converted conn_uptime of %d\n", c_uptime)
+			// fmt.Printf("Converted conn_uptime of %d\n", connUptime)
+			recorder.measureConnected(1)
+			recorder.measureConnUptime(connUptime)
 		} else if strings.HasPrefix(str, "disconnected;") {
 			// <link_status value="disconnected%3Badsl%3B0" />
-			mu.Lock()
-			state = S_DISCONNECTED
-			connuptime = 0
-			lastpoll = polltime
-			laststatuscode = statuscode
-			lastpolldur = dur_poll
-			lastparsedur = dur_parse
+			recorder.measureConnected(0)
+			recorder.measureConnUptime(0)
 			if err != nil {
-				lasterror = err.Error()
+				// TODO - do something with err.Error() ?
 			}
-			lasterrortime = parsetime
-			mu.Unlock()
 			return nil
 		} else { // TODO handle more states
 			// TODO - handle this more gracefully
@@ -159,14 +125,15 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 
 	// sysuptime
 	// <sysuptime value="973412"/>
-	if val := xmlquery.FindOne(x_status, "//sysuptime/@value"); val != nil {
+	if val := xmlquery.FindOne(xStatus, "//sysuptime/@value"); val != nil {
 		// fmt.Printf("Got sysuptime value of [%s]\n", val.InnerText())
-		s_uptime, err = strconv.Atoi(val.InnerText())
+		sysUptime, err := strconv.Atoi(val.InnerText())
 		if err != nil {
 			// TODO - failed to convert uptime
 			log.Fatal("Failed to convert uptime:", err)
 		}
-		// fmt.Printf("Converted sysuptime of %d\n", s_uptime)
+		// fmt.Printf("Converted sysuptime of %d\n", sysUptime)
+		recorder.measureSysUptime(sysUptime)
 	} else {
 		// TODO - can't get sysuptime
 		log.Fatal("No <sysuptime>")
@@ -174,7 +141,7 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 
 	// speeds from status_rate
 	// <status_rate type="array" value="[['0%3B0%3B0%3B0'], ['18567000%3B65059000%3B0%3B0'], ['0%3B0%3B0%3B0'], null]"/>
-	if val := xmlquery.FindOne(x_status, "//status_rate/@value"); val != nil {
+	if val := xmlquery.FindOne(xStatus, "//status_rate/@value"); val != nil {
 		// fmt.Printf("Got raw status_rate value of [%s]\n", val.InnerText())
 		str, err := url.QueryUnescape(val.InnerText())
 		if err != nil {
@@ -183,11 +150,13 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 		}
 		str = strings.Replace(str, "\n", "", -1)
 		// fmt.Printf("Got status_rate value of [%s]\n", str)
-		segs := substring_square_brackets_re.FindAllString(str, -1)
+		segs := substringSquareBracketsRe.FindAllString(str, -1)
 		found := false
 		for _, z := range segs {
 			if z != "'0;0;0;0'" && z != "," && z != ",null" {
-				n, err := fmt.Sscanf(z, "'%d;%d;0;0'", &speed_up, &speed_down)
+				speedUp := 0
+				speedDown := 0
+				n, err := fmt.Sscanf(z, "'%d;%d;0;0'", &speedUp, &speedDown)
 				if err != nil {
 					log.Fatal("status_rate:format1")
 				}
@@ -197,8 +166,12 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 				if found {
 					log.Fatal("status_rate:Already found")
 				}
+
 				found = true
-				// fmt.Printf("Got %d and %d for status_rate\n", speed_up, speed_down)
+				// fmt.Printf("Got %d and %d for status_rate\n", speedUp, speedDown)
+
+				recorder.measureSpeedUp(speedUp)
+				recorder.measureSpeedDown(speedDown)
 			}
 		}
 	} else {
@@ -208,7 +181,7 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 
 	// bytes up/down
 	// <wan_conn_volume_list type="array" value="[['0%3B0%3B0'], ['81650478525%3B67192513981%3B14457964544'], ['0%3B0%3B0'], null]"/>
-	if val := xmlquery.FindOne(x_status, "//wan_conn_volume_list/@value"); val != nil {
+	if val := xmlquery.FindOne(xStatus, "//wan_conn_volume_list/@value"); val != nil {
 		// fmt.Printf("Got raw wan_conn_volume_list value of [%s]\n", val.InnerText())
 		str, err := url.QueryUnescape(val.InnerText())
 		if err != nil {
@@ -217,12 +190,14 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 		}
 		str = strings.Replace(str, "\n", "", -1)
 		// fmt.Printf("Got wan_conn_volume_list value of [%s]\n", str)
-		segs := substring_square_brackets_re.FindAllString(str, -1)
+		segs := substringSquareBracketsRe.FindAllString(str, -1)
 		found := false
 		for _, z := range segs {
 			if z != "'0;0;0'" && z != "," && z != ",null" {
-				bytes_total := 0
-				n, err := fmt.Sscanf(z, "'%d;%d;%d'", &bytes_total, &bytes_down, &bytes_up)
+				bytesTotal := 0
+				bytesUp := 0
+				bytesDown := 0
+				n, err := fmt.Sscanf(z, "'%d;%d;%d'", &bytesTotal, &bytesDown, &bytesUp)
 				if err != nil {
 					log.Fatal("wan_conn_volume_list:format1", z)
 				}
@@ -233,7 +208,9 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 					log.Fatal("wan_conn_volume_list:Already found")
 				}
 				found = true
-				// fmt.Printf("Got %d and %d for wan_conn_volume_list\n", bytes_up, bytes_down)
+				recorder.measureBytesUp(bytesUp)
+				recorder.measureBytesDown(bytesDown)
+				// fmt.Printf("Got %d and %d for wan_conn_volume_list\n", bytesUp, bytesDown)
 			}
 		}
 	} else {
@@ -244,179 +221,34 @@ func parseXML(body string, polltime time.Time, dur_poll time.Duration, statuscod
 	// TODO anything else from this?
 	// <wan_linestatus_rate_list type="array" value="[['UP','VDSL2','Profile%2017a','31','58','186','83','202','83','130','74','65059','18567','65682000','18564000','fast'], null]"/>
 
-	mu.Lock()
-	state = S_CONNECTED
-	lastgoodpoll = polltime
-	lastpoll = polltime
-	laststatuscode = statuscode
-	lastpolldur = dur_poll
-	lastparsedur = dur_parse
-	bps_up = speed_up
-	bps_down = speed_down
-	bbu_up = bytes_up
-	bbu_down = bytes_down
-	sysuptime = s_uptime
-	connuptime = c_uptime
-	mu.Unlock()
-
 	return nil
-}
-
-func metricText() string {
-	// Build the response text based on current state
-	mu.Lock()
-	curr_state := state
-	str_lastgoodpoll := fmt.Sprintf("%.6f", float64(lastgoodpoll.UnixMicro())/usec_in_s)
-	str_lastpoll := fmt.Sprintf("%.6f", float64(lastpoll.UnixMicro())/usec_in_s)
-	str_laststatuscode := strconv.Itoa(laststatuscode)
-	str_lastpolldur := fmt.Sprintf("%.6f", float64(lastpolldur.Microseconds())/usec_in_s)
-	str_lastparsedur := fmt.Sprintf("%.6f", float64(lastparsedur.Microseconds())/usec_in_s)
-	str_lasterror := lasterror
-	str_lasterrortime := fmt.Sprintf("%.6f", float64(lasterrortime.UnixMicro())/usec_in_s)
-	str_bps_up := strconv.Itoa(bps_up)
-	str_bps_down := strconv.Itoa(bps_down)
-	str_bbu_up := strconv.Itoa(bbu_up)
-	str_bbu_down := strconv.Itoa(bbu_down)
-	str_sysuptime := strconv.Itoa(sysuptime)
-	str_connuptime := strconv.Itoa(connuptime)
-	mu.Unlock()
-
-	// Create the response
-	response_text := ""
-	if curr_state == S_INIT {
-		response_text = "Argle\n"
-	} else if curr_state == S_DISCONNECTED {
-		response_text += "# HELP btsmarthub2_connected Whether the Broadband is connected\n"
-		response_text += "# TYPE btsmarthub2_connected gauge\n"
-		response_text += "btsmarthub2_connected 0\n"
-
-		response_text += "# HELP btsmarthub2_laststatuscode The HTTP status code of the last poll\n"
-		response_text += "# TYPE btsmarthub2_laststatuscode gauge\n"
-		response_text += "btsmarthub2_laststatuscode " + str_laststatuscode + "\n"
-
-		response_text += "# HELP btsmarthub2_lastgoodpoll_seconds The UNIX timestamp in seconds of the last good poll\n"
-		response_text += "# TYPE btsmarthub2_lastgoodpoll_seconds counter\n"
-		response_text += "btsmarthub2_lastgoodpoll_seconds " + str_lastgoodpoll + "\n"
-
-		response_text += "# HELP btsmarthub2_lastpoll_seconds The UNIX timestamp in seconds of the last poll\n"
-		response_text += "# TYPE btsmarthub2_lastpoll_seconds counter\n"
-		response_text += "btsmarthub2_lastpoll_seconds " + str_lastpoll + "\n"
-
-		response_text += "# HELP btsmarthub2_lastpolldur_seconds The duration of the poll\n"
-		response_text += "# TYPE btsmarthub2_lastpolldur_seconds counter\n"
-		response_text += "btsmarthub2_lastpolldur_seconds " + str_lastpolldur + "\n"
-
-		response_text += "# HELP btsmarthub2_lastparsedur_seconds The duration of the poll\n"
-		response_text += "# TYPE btsmarthub2_lastparsedur_seconds counter\n"
-		response_text += "btsmarthub2_lastparsedur_seconds " + str_lastparsedur + "\n"
-
-		if str_lasterror != "" {
-			response_text += "# HELP btsmarthub2_lasterrortime_seconds The UNIX timestamp in seconds of the last error\n"
-			response_text += "# TYPE btsmarthub2_lasterrortime_seconds counter\n"
-			response_text += "btsmarthub2_lasterrortime_seconds " + str_lasterrortime + "\n"
-		}
-
-		response_text += "# HELP btsmarthub2_sysuptime_seconds The sysuptime of the BB router in seconds\n"
-		response_text += "# TYPE btsmarthub2_sysuptime_seconds counter\n"
-		response_text += "btsmarthub2_sysuptime_seconds " + str_sysuptime + "\n"
-
-		response_text += "# HELP btsmarthub2_connuptime_seconds The connuptime of the BB connection in seconds\n"
-		response_text += "# TYPE btsmarthub2_connuptime_seconds counter\n"
-		response_text += "btsmarthub2_connuptime_seconds " + str_connuptime + "\n"
-
-	} else if curr_state == S_CONNECTED {
-		response_text += "# HELP btsmarthub2_connected Whether the Broadband is connected\n"
-		response_text += "# TYPE btsmarthub2_connected gauge\n"
-		response_text += "btsmarthub2_connected 1\n"
-
-		response_text += "# HELP btsmarthub2_laststatuscode The HTTP status code of the last poll\n"
-		response_text += "# TYPE btsmarthub2_laststatuscode gauge\n"
-		response_text += "btsmarthub2_laststatuscode " + str_laststatuscode + "\n"
-
-		response_text += "# HELP btsmarthub2_lastgoodpoll_seconds The UNIX timestamp in seconds of the last good poll\n"
-		response_text += "# TYPE btsmarthub2_lastgoodpoll_seconds counter\n"
-		response_text += "btsmarthub2_lastgoodpoll_seconds " + str_lastgoodpoll + "\n"
-
-		response_text += "# HELP btsmarthub2_lastpoll_seconds The UNIX timestamp in seconds of the last poll\n"
-		response_text += "# TYPE btsmarthub2_lastpoll_seconds counter\n"
-		response_text += "btsmarthub2_lastpoll_seconds " + str_lastpoll + "\n"
-
-		response_text += "# HELP btsmarthub2_lastpolldur_seconds The duration of the poll\n"
-		response_text += "# TYPE btsmarthub2_lastpolldur_seconds counter\n"
-		response_text += "btsmarthub2_lastpolldur_seconds " + str_lastpolldur + "\n"
-
-		response_text += "# HELP btsmarthub2_lastparsedur_seconds The duration of the poll\n"
-		response_text += "# TYPE btsmarthub2_lastparsedur_seconds counter\n"
-		response_text += "btsmarthub2_lastparsedur_seconds " + str_lastparsedur + "\n"
-
-		if str_lasterror != "" {
-			response_text += "# HELP btsmarthub2_lasterrortime_seconds The UNIX timestamp in seconds of the last error\n"
-			response_text += "# TYPE btsmarthub2_lasterrortime_seconds counter\n"
-			response_text += "btsmarthub2_lasterrortime_seconds " + str_lasterrortime + "\n"
-		}
-
-		response_text += "# HELP btsmarthub2_bb_speed_up The upload broadband speed in bps\n"
-		response_text += "# TYPE btsmarthub2_bb_speed_up gauge\n"
-		response_text += "btsmarthub2_bb_speed_up " + str_bps_up + "\n"
-
-		response_text += "# HELP btsmarthub2_bb_speed_down The download broadband speed in bps\n"
-		response_text += "# TYPE btsmarthub2_bb_speed_down gauge\n"
-		response_text += "btsmarthub2_bb_speed_down " + str_bps_down + "\n"
-
-		response_text += "# HELP btsmarthub2_bb_bytes_up The number of bytes uploaded\n"
-		response_text += "# TYPE btsmarthub2_bb_bytes_up counter\n"
-		response_text += "btsmarthub2_bb_bytes_up " + str_bbu_up + "\n"
-
-		response_text += "# HELP btsmarthub2_bb_bytes_down The number of bytes downloaded\n"
-		response_text += "# TYPE btsmarthub2_bb_bytes_down counter\n"
-		response_text += "btsmarthub2_bb_bytes_down " + str_bbu_down + "\n"
-
-		response_text += "# HELP btsmarthub2_sysuptime_seconds The sysuptime of the BB router in seconds\n"
-		response_text += "# TYPE btsmarthub2_sysuptime_seconds counter\n"
-		response_text += "btsmarthub2_sysuptime_seconds " + str_sysuptime + "\n"
-
-		response_text += "# HELP btsmarthub2_connuptime_seconds The connuptime of the BB connection in seconds\n"
-		response_text += "# TYPE btsmarthub2_connuptime_seconds counter\n"
-		response_text += "btsmarthub2_connuptime_seconds " + str_connuptime + "\n"
-	} else {
-		response_text = "unknown_state:" + strconv.Itoa(curr_state) + "\n"
-		// TODO
-	}
-	// TODO - handle other states
-	return response_text
-}
-
-func HandleMetrics(w http.ResponseWriter, req *http.Request) {
-	output := metricText()
-	// Send the response
-	// Grab a string representation of all of the metrics
-	w.WriteHeader(http.StatusOK)
-	w.Header().Set("Content-type:", "text/plain")
-	w.Write([]byte(output))
 }
 
 func doPoll() {
 	// url := fmt.Sprintf("http://%s:%d/%s", cfg.ipaddress, cfg.port, cfg.pollurl)
 	url := fmt.Sprintf("http://%s/%s", cfg.ipaddress, cfg.pollurl)
-	polltime := time.Now()
+	pollTime := time.Now()
 	req, err := http.NewRequest("GET", url, nil)
 	req.Header.Set("Referer", "http://192.168.1.254/")
 	resp, err := hc.Do(req)
-	dur_poll := time.Since(polltime)
+	durPoll := time.Since(pollTime)
+
+	recorder.measurePolls()
+
+	recorder.measureLastPoll(pollTime)
+	recorder.measurePollDur(durPoll)
 
 	if err != nil {
 		fmt.Printf("Got error [%s]\n", err)
-		mu.Lock()
-		state = S_ERROR
-		lastpoll = polltime
-		lastpolldur = dur_poll
-		lasterror = err.Error()
-		lasterrortime = polltime
-		mu.Unlock()
+		// TODO - do anything with err.Error() ?
+		recorder.measureLastError(pollTime)
 		return
 	}
 	// Got a good response!
 	defer resp.Body.Close()
+
+	// Log the statusCode
+	recorder.measureStatusCode(resp.StatusCode)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -426,12 +258,12 @@ func doPoll() {
 
 	// Stash the downloaded file if we have a datastore configured
 	if cfg.datastore != "" {
-		fname := cfg.datastore + "/" + polltime.Format("20060102150405.000000")
+		fname := cfg.datastore + "/" + pollTime.Format("20060102150405.000000")
 		// fmt.Printf("fname = [%s]\n", fname)
 		os.WriteFile(fname, body, 0644)
 	}
 	// parse file and update values
-	err = parseXML(string(body), polltime, dur_poll, resp.StatusCode)
+	err = parseXML(string(body))
 	if err != nil {
 		// TODO Do something
 	}
@@ -442,6 +274,8 @@ func main() {
 	RegisterFlagsWithPrefix("")
 	flag.Parse()
 
+	recorder = NewRecorder(prometheus.DefaultRegisterer) // TODO - prefix
+
 	// check if we are parsing a single file
 	if cfg.file != "" {
 		// TODO read in file
@@ -450,7 +284,7 @@ func main() {
 			log.Fatal("ReadFile:", err)
 		}
 		// parse it
-		err = parseXML(string(body), time.Now(), 1*time.Second, 0)
+		err = parseXML(string(body))
 		if err != nil {
 			log.Fatal("parseXML:", err)
 		}
@@ -460,9 +294,10 @@ func main() {
 		return
 	}
 
-	http.HandleFunc(cfg.metricurl, HandleMetrics)
-	listenaddr := ":" + strconv.Itoa(cfg.metricport)
+	// Serve Prom metrics on cfg.metricport
 	go func() {
+		listenaddr := ":" + strconv.Itoa(cfg.metricport)
+		http.Handle("/metrics", promhttp.Handler())
 		err := http.ListenAndServe(listenaddr, nil)
 		if err != nil {
 			log.Fatal("ListenAndServe:", err)
