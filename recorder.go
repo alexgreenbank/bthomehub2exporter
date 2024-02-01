@@ -13,7 +13,7 @@ const (
 
 type Recorder interface {
 	measureConnected(up int)
-	measurePolls()
+	measurePolls(state string)
 	measureStatusCode(code int)
 	measureLastGoodPoll(ts time.Time)
 	measureLastPoll(ts time.Time) // Time (UTC) of last poll
@@ -30,74 +30,74 @@ type Recorder interface {
 
 func NewRecorder(reg prometheus.Registerer) Recorder {
 	r := &prometheusRecorder{
-		btsmarthub2Polls: prometheus.NewCounter(prometheus.CounterOpts{
+		btsmarthub2Polls: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2Polls",
+			Name:      "btsmarthub2_polls",
 			Help:      "Number of polls we have attempted",
-		}),
+		}, []string{"state"}),
 		btsmarthub2Connected: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2Connected",
+			Name:      "btsmarthub2_connected",
 			Help:      "Whether the Broadband is connected",
 		}),
 		btsmarthub2StatusCodeCount: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2StatusCodeCount",
+			Name:      "btsmarthub2_status_code_count",
 			Help:      "A count of each status code encountered",
 		}, []string{"statusCode"}),
 		btsmarthub2LastGoodPollSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2LastGoodPollSeconds",
+			Name:      "btsmarthub2_last_good_poll_seconds",
 			Help:      "The UNIX timestamp in seconds of the last good poll",
 		}),
 		btsmarthub2LastPollSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2LastPollSeconds",
+			Name:      "btsmarthub2_last_poll_seconds",
 			Help:      "The UNIX timestamp in seconds of the last poll",
 		}),
 		btsmarthub2PollDurSeconds: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2PollDurSeconds",
+			Name:      "btsmarthub2_poll_duration",
 			Help:      "The total duration of polling",
 		}),
 		btsmarthub2ParseDurSeconds: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2ParseDurSeconds",
+			Name:      "btsmarthub2_parse_duration",
 			Help:      "The total duration of parsing",
 		}),
 		btsmarthub2LastErrorTimeSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2LastErrorTimeSeconds",
+			Name:      "btsmarthub2_last_error_time_seconds",
 			Help:      "The UNIX timestamp in seconds of the last error",
 		}),
 		btsmarthub2SpeedUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2SpeedUp",
+			Name:      "btsmarthub2_speed_up",
 			Help:      "The upload broadband speed in bps",
 		}),
 		btsmarthub2SpeedDown: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2SpeedDown",
+			Name:      "btsmarthub2_speed_down",
 			Help:      "The download broadband speed in bps",
 		}),
 		btsmarthub2BytesUp: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2BytesUp",
+			Name:      "btsmarthub2_bytes_up",
 			Help:      "The number of bytes uploaded",
 		}),
 		btsmarthub2BytesDown: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2BytesDown",
+			Name:      "btsmarthub2_bytes_down",
 			Help:      "The number of bytes downloaded",
 		}),
 		btsmarthub2SysUptimeSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2SysUptimeSeconds",
+			Name:      "btsmarthub2_sysuptime_seconds",
 			Help:      "The sysuptime of the BB router in seconds",
 		}),
 		btsmarthub2ConnUptimeSeconds: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: prefix,
-			Name:      "btsmarthub2ConnUptimeSeconds",
+			Name:      "btsmarthub2_connuptime_seconds",
 			Help:      "The connuptime of the BB router in seconds",
 		}),
 	}
@@ -110,7 +110,7 @@ func NewRecorder(reg prometheus.Registerer) Recorder {
 }
 
 type prometheusRecorder struct {
-	btsmarthub2Polls                prometheus.Counter
+	btsmarthub2Polls                *prometheus.CounterVec
 	btsmarthub2Connected            prometheus.Gauge
 	btsmarthub2StatusCodeCount      *prometheus.CounterVec
 	btsmarthub2LastGoodPollSeconds  prometheus.Gauge
@@ -127,8 +127,8 @@ type prometheusRecorder struct {
 }
 
 // Count the number of polls we have made
-func (r prometheusRecorder) measurePolls() {
-	r.btsmarthub2Polls.Inc()
+func (r prometheusRecorder) measurePolls(state string) {
+	r.btsmarthub2Polls.WithLabelValues(state).Inc()
 }
 
 // Whether the Broadband is connected

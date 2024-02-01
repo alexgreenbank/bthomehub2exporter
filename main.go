@@ -233,8 +233,6 @@ func doPoll() {
 	resp, err := hc.Do(req)
 	durPoll := time.Since(pollTime)
 
-	recorder.measurePolls()
-
 	recorder.measureLastPoll(pollTime)
 	recorder.measurePollDur(durPoll)
 
@@ -242,6 +240,7 @@ func doPoll() {
 		fmt.Printf("Got error [%s]\n", err)
 		// TODO - do anything with err.Error() ?
 		recorder.measureLastError(pollTime)
+		recorder.measurePolls("error")
 		return
 	}
 	// Got a good response!
@@ -253,8 +252,12 @@ func doPoll() {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// TODO
+		recorder.measurePolls("error-readall")
 		return
 	}
+
+	recorder.measurePolls("ok")
+	recorder.measureLastGoodPoll(pollTime)
 
 	// Stash the downloaded file if we have a datastore configured
 	if cfg.datastore != "" {
